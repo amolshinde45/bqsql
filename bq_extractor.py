@@ -37,7 +37,7 @@ class BqExtractor:
             quoting_style="none"
         )
 
-        # Target file size
+        # Target file size in bytes
         self.limit_bytes = self.config.TARGET_FILE_SIZE_MB * 1024 * 1024
 
         # Performance tracking
@@ -56,44 +56,30 @@ class BqExtractor:
 
     def _clean_batch(self, arrow_batch):
         """
-        Clean and transform Arrow batch for SQL Server compatibility
-        Optimized for performance
+        Clean and transform Arrow batch for SQL Server compatibility.
+        Optimized for performance.
         """
         new_columns = []
 
         for field in arrow_batch.schema:
             col = arrow_batch[field.name]
 
-            # Type conversions
             if pa.types.is_date(field.type):
                 col = pc.strftime(col, format='%Y-%m-%d')
-
             elif pa.types.is_timestamp(field.type):
                 col = pc.strftime(col, format='%Y-%m-%d %H:%M:%S')
-
             elif pa.types.is_boolean(field.type):
                 col = pc.if_else(col, "1", "0")
-
             elif pa.types.is_decimal(field.type):
                 pass
-
             elif pa.types.is_time(field.type):
                 col = pc.strftime(col, format='%H:%M:%S')
 
-            # Cast everything to string for CSV
             col = col.cast(pa.string())
-
-            # Remove double quotes (they can break pipe-delimited format)
             col = pc.replace_substring(col, pattern='"', replacement='')
-
-            # Replace pipe characters if they exist in data
             col = pc.replace_substring(col, pattern='|', replacement='')
-
-            # Replace newlines and carriage returns
             col = pc.replace_substring(col, pattern='\n', replacement=' ')
             col = pc.replace_substring(col, pattern='\r', replacement=' ')
-
-            # Handle nulls - replace with empty string
             col = pc.fill_null(col, "")
 
             new_columns.append(col)
@@ -105,7 +91,7 @@ class BqExtractor:
 
     def _open_new_gcs_file(self, stream_idx, part_idx, schema):
         """
-        Open new GCS file for writing
+        Open new GCS file for writing.
         Returns: (file_object, csv_writer, gcs_path)
         """
         gcs_path = (
@@ -130,64 +116,109 @@ class BqExtractor:
 
     def _process_stream(self, stream_name, stream_idx):
         """
-        Process a single BigQuery Storage API stream
-        Writes data to GCS in chunks
+        Process a single BigQuery Storage API stream.
+        Writes data to GCS in chunks, queuing each file as it completes.
+        Logs every page so progress is visible even for slow/large streams.
         """
         reader = self.client.read_rows(stream_name)
 
         rows_in_stream = 0
+        bytes_in_stream = 0
+        page_count = 0
         part_idx = 1
         file_obj, writer, gcs_path = None, None, None
+        stream_start = time.time()
         last_log_time = time.time()
+
+        self._log(f"Stream {stream_idx}: START reading")
 
         try:
             for page in reader.rows().pages:
-                batch = self._clean_batch(page.to_arrow())
+                page_start = time.time()
 
+                # Clean the Arrow batch
+                batch = self._clean_batch(page.to_arrow())
+                page_rows = batch.num_rows
+
+                if page_rows == 0:
+                    continue
+
+                page_count += 1
+                rows_in_stream += page_rows
+
+                # Open new file if needed
                 if file_obj is None:
                     file_obj, writer, gcs_path = self._open_new_gcs_file(
                         stream_idx, part_idx, batch.schema
                     )
+                    self._log(f"Stream {stream_idx}: Opened file part {part_idx} -> {os.path.basename(gcs_path)}")
 
+                # Write batch to CSV
                 writer.write_batch(batch)
-                rows_in_stream += batch.num_rows
+                current_size = file_obj.tell()
+                bytes_in_stream += current_size
 
-                if time.time() - last_log_time > 10:
-                    current_size_mb = file_obj.tell() / (1024 * 1024)
-                    self._log(f"Stream {stream_idx}: {current_size_mb:.2f}MB written to {os.path.basename(gcs_path)}")
+                page_elapsed = time.time() - page_start
+                current_mb = current_size / (1024 * 1024)
+
+                # Log every page so we know extraction is alive
+                if time.time() - last_log_time >= 5:
+                    stream_elapsed = time.time() - stream_start
+                    rows_per_sec = rows_in_stream / stream_elapsed if stream_elapsed > 0 else 0
+                    self._log(
+                        f"Stream {stream_idx} | Page {page_count} | "
+                        f"Rows: {rows_in_stream:,} ({rows_per_sec:,.0f} r/s) | "
+                        f"File: {current_mb:.1f}/{self.config.TARGET_FILE_SIZE_MB} MB | "
+                        f"Part: {part_idx}"
+                    )
                     last_log_time = time.time()
 
-                current_size = file_obj.tell()
+                # Check file size and rotate if needed
                 if current_size >= self.limit_bytes:
                     writer.close()
                     file_obj.close()
-                    self._log(f"Completed file: {os.path.basename(gcs_path)}")
+                    final_mb = current_size / (1024 * 1024)
+                    self._log(
+                        f"Stream {stream_idx}: Completed file {os.path.basename(gcs_path)} "
+                        f"({final_mb:.1f} MB) -> queued for loading"
+                    )
 
                     self.file_queue.put((gcs_path, self.table_cfg))
-
                     self.stats['files_created'] += 1
                     self.stats['bytes_written'] += current_size
 
+                    # Open next file
                     part_idx += 1
                     file_obj, writer, gcs_path = self._open_new_gcs_file(
                         stream_idx, part_idx, batch.schema
                     )
+                    self._log(f"Stream {stream_idx}: Opened file part {part_idx} -> {os.path.basename(gcs_path)}")
                     last_log_time = time.time()
 
+            # Close and queue final file
             if writer and file_obj:
                 writer.close()
+                final_size = file_obj.tell()
                 file_obj.close()
-                self._log(f"Completed file: {os.path.basename(gcs_path)}")
 
-                self.file_queue.put((gcs_path, self.table_cfg))
-
-                self.stats['files_created'] += 1
-                final_size = file_obj.tell() if hasattr(file_obj, 'tell') else 0
-                self.stats['bytes_written'] += final_size
+                if final_size > 0:
+                    final_mb = final_size / (1024 * 1024)
+                    self._log(
+                        f"Stream {stream_idx}: Final file {os.path.basename(gcs_path)} "
+                        f"({final_mb:.1f} MB) -> queued for loading"
+                    )
+                    self.file_queue.put((gcs_path, self.table_cfg))
+                    self.stats['files_created'] += 1
+                    self.stats['bytes_written'] += final_size
+                else:
+                    # Empty final file - discard
+                    try:
+                        self.gcs.rm(gcs_path)
+                    except:
+                        pass
 
         except Exception as e:
-            self._log(f"ERROR processing stream {stream_idx}: {str(e)}")
-
+            self._log(f"ERROR in stream {stream_idx}: {str(e)}")
             if writer:
                 try:
                     writer.close()
@@ -198,17 +229,23 @@ class BqExtractor:
                     file_obj.close()
                 except:
                     pass
-
             raise
+
+        stream_elapsed = time.time() - stream_start
+        throughput = rows_in_stream / stream_elapsed if stream_elapsed > 0 else 0
+        self._log(
+            f"Stream {stream_idx}: DONE | {rows_in_stream:,} rows | "
+            f"{page_count} pages | {part_idx} files | "
+            f"{stream_elapsed:.1f}s | {throughput:,.0f} rows/s"
+        )
 
         return rows_in_stream
 
     def run(self, stream_chunk):
         """
-        Main worker method - processes assigned streams
+        Main worker method - processes assigned streams sequentially.
         """
         self.stats['start_time'] = time.time()
-
         self._log(f"Worker started. Processing {len(stream_chunk)} streams.")
 
         total_rows = 0
@@ -218,11 +255,10 @@ class BqExtractor:
                 rows = self._process_stream(stream_name, i)
                 total_rows += rows
                 self.stats['rows_processed'] += rows
-
                 self._log(f"Completed stream {i}/{len(stream_chunk)}: {rows:,} rows")
 
             except Exception as e:
-                self._log(f"CRITICAL ERROR on stream {stream_name}: {str(e)}")
+                self._log(f"CRITICAL ERROR on stream {i}: {str(e)}")
                 continue
 
         elapsed = time.time() - self.stats['start_time']
@@ -230,10 +266,10 @@ class BqExtractor:
 
         summary = (
             f"Worker {self.worker_id} COMPLETE: "
-            f"{total_rows:,} rows, "
-            f"{self.stats['files_created']} files, "
-            f"{self.stats['bytes_written'] / (1024 ** 3):.2f} GB, "
-            f"{elapsed:.1f}s, "
+            f"{total_rows:,} rows | "
+            f"{self.stats['files_created']} files | "
+            f"{self.stats['bytes_written'] / (1024 ** 3):.2f} GB | "
+            f"{elapsed:.1f}s | "
             f"{throughput:,.0f} rows/s"
         )
 
@@ -242,9 +278,7 @@ class BqExtractor:
 
 
 def extractor_worker(args):
-    """
-    Multiprocessing worker entry point
-    """
+    """Multiprocessing worker entry point"""
     stream_chunk, worker_id, config, table_cfg, file_queue, log_queue = args
 
     extractor = BqExtractor(
