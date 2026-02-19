@@ -10,12 +10,15 @@ import gcsfs
 
 
 class BqExtractor:
-    def __init__(self, worker_id, config, table_cfg, log_queue, file_queue):
+    def __init__(self, worker_id, config, table_cfg, log_queue, file_queue, arrow_schema_bytes):
         self.worker_id = worker_id
         self.config = config
         self.table_cfg = table_cfg
         self.log_queue = log_queue
         self.file_queue = file_queue
+
+        # Deserialize Arrow schema from bytes (passed from orchestrator's read_session)
+        self.arrow_schema = pa.ipc.read_schema(pa.py_buffer(arrow_schema_bytes))
 
         self.client = bigquery_storage.BigQueryReadClient(
             credentials=config.BQ_CREDENTIALS if hasattr(config, 'BQ_CREDENTIALS') else None
@@ -102,37 +105,40 @@ class BqExtractor:
 
     def _process_stream(self, stream_name, stream_idx):
         """
-        Process a single BQ Storage API stream (ARROW format).
+        Process a single BQ Storage API stream using ARROW format.
 
-        API USAGE NOTE:
-        ---------------
-        client.read_rows(stream_name) returns a ReadRowsStream.
+        CORRECT API USAGE (confirmed from official docs):
+        --------------------------------------------------
+        ReadRowsStream (returned by client.read_rows()) is a plain iterable of
+        ReadRowsResponse proto messages. It has NO .pages attribute.
 
-        ReadRowsStream has TWO iteration modes:
-          1. reader.pages       -> ReadRowsPage iterator (CORRECT for Arrow)
-                                   page.to_arrow() gives pyarrow.RecordBatch
-          2. reader.rows().pages -> AVRO-style page iteration (WRONG for Arrow,
-                                   hangs waiting for page boundaries)
+        ReadRowsResponse.arrow_record_batch is a proto ATTRIBUTE (not callable).
+        Its .serialized_record_batch field contains raw Arrow IPC bytes.
 
-        ReadRowsResponse (raw message) has:
-          .arrow_record_batch   -> ArrowRecordBatch proto OBJECT (attribute, NOT callable)
-          Calling it as .arrow_record_batch() raises "ArrowRecordBatch not callable"
+        To get a pyarrow.RecordBatch from each response:
+            buf   = pa.py_buffer(response.arrow_record_batch.serialized_record_batch)
+            batch = pa.ipc.read_record_batch(buf, self.arrow_schema)
 
-        We use reader.pages -> page.to_arrow() which is the correct Arrow path.
+        The schema must be obtained from the read_session in the orchestrator:
+            schema = pa.ipc.read_schema(
+                pa.py_buffer(session.arrow_schema.serialized_schema)
+            )
+        and passed as arrow_schema_bytes into the worker args.
 
-        BYTE TRACKING:
-        --------------
-        Uses self-tracked bytes_in_current_file (batch.nbytes) instead of
-        file_obj.tell() because gcsfs resets the buffer pointer to 0 after close().
+        WHAT DOES NOT WORK:
+          - reader.pages        -> AttributeError: no attribute 'pages'
+          - reader.rows().pages -> hangs (AVRO pattern, no page boundaries on Arrow)
+          - response.arrow_record_batch() -> TypeError: proto object not callable
+          - reader.to_arrow()   -> loads entire stream into RAM (bad for 100GB)
         """
-        STREAM_TIMEOUT = 600  # 10 min max per stream - prevents infinite hangs
+        STREAM_TIMEOUT = 600  # 10 min per stream prevents infinite hangs
 
         file_obj = None
         writer = None
         gcs_path = None
         bytes_in_current_file = 0
         rows_in_stream = 0
-        page_count = 0
+        response_count = 0
         part_idx = 1
 
         stream_start = time.time()
@@ -141,25 +147,24 @@ class BqExtractor:
         self._log(f"Stream {stream_idx}: START reading")
 
         try:
-            # CORRECT: reader.pages iterates ReadRowsPage objects
-            # page.to_arrow() returns pyarrow.RecordBatch natively
-            # DO NOT use reader.rows().pages (AVRO pattern - hangs on Arrow streams)
-            # DO NOT call response.arrow_record_batch() (proto attribute, not callable)
-            reader = self.client.read_rows(stream_name, timeout=STREAM_TIMEOUT)
+            # Iterate ReadRowsResponse messages directly (the only correct way)
+            for response in self.client.read_rows(stream_name, timeout=STREAM_TIMEOUT):
 
-            for page in reader.pages:
-                # page.to_arrow() -> pyarrow.RecordBatch (correct Arrow extraction)
-                raw_batch = page.to_arrow()
+                # Deserialize Arrow IPC bytes -> pyarrow.RecordBatch
+                buf = pa.py_buffer(
+                    response.arrow_record_batch.serialized_record_batch
+                )
+                raw_batch = pa.ipc.read_record_batch(buf, self.arrow_schema)
 
                 if raw_batch.num_rows == 0:
                     continue
 
                 batch = self._clean_batch(raw_batch)
-                page_count += 1
+                response_count += 1
                 rows_in_stream += batch.num_rows
-                page_bytes = batch.nbytes  # Arrow in-memory bytes (proxy for CSV size)
+                page_bytes = batch.nbytes  # Arrow in-memory bytes (proxy for rotation)
 
-                # Open GCS file on first page
+                # Open GCS file on first response
                 if file_obj is None:
                     file_obj, writer, gcs_path = self._open_new_gcs_file(
                         stream_idx, part_idx, batch.schema
@@ -180,7 +185,7 @@ class BqExtractor:
                     rps = rows_in_stream / elapsed if elapsed > 0 else 0
                     file_mb = bytes_in_current_file / (1024 * 1024)
                     self._log(
-                        f"Stream {stream_idx} | Page {page_count} | "
+                        f"Stream {stream_idx} | Response {response_count} | "
                         f"Rows: {rows_in_stream:,} ({rps:,.0f} r/s) | "
                         f"File: {file_mb:.1f}/{self.config.TARGET_FILE_SIZE_MB} MB | "
                         f"Part: {part_idx}"
@@ -204,7 +209,7 @@ class BqExtractor:
                     )
                     last_log_time = time.time()
 
-            # Always queue the final file (never rely on tell() == 0 check)
+            # Always queue the final file
             if file_obj is not None and writer is not None:
                 self._close_and_queue_file(
                     file_obj, writer, gcs_path,
@@ -229,7 +234,7 @@ class BqExtractor:
         throughput = rows_in_stream / stream_elapsed if stream_elapsed > 0 else 0
         self._log(
             f"Stream {stream_idx}: DONE | {rows_in_stream:,} rows | "
-            f"{page_count} pages | {part_idx} file(s) | "
+            f"{response_count} responses | {part_idx} file(s) | "
             f"{stream_elapsed:.1f}s | {throughput:,.0f} rows/s"
         )
         return rows_in_stream
@@ -267,12 +272,13 @@ class BqExtractor:
 
 def extractor_worker(args):
     """Multiprocessing worker entry point."""
-    stream_chunk, worker_id, config, table_cfg, file_queue, log_queue = args
+    stream_chunk, worker_id, config, table_cfg, file_queue, log_queue, arrow_schema_bytes = args
     extractor = BqExtractor(
         worker_id=worker_id,
         config=config,
         table_cfg=table_cfg,
         log_queue=log_queue,
-        file_queue=file_queue
+        file_queue=file_queue,
+        arrow_schema_bytes=arrow_schema_bytes
     )
     return extractor.run(stream_chunk)
