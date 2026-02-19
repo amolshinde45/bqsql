@@ -1,223 +1,446 @@
-# bq_extractor.py - BigQuery Data Extraction
+# main_orchestrator.py - Pipeline Orchestration
 
 import os
+import json
 import time
-import pyarrow as pa
-import pyarrow.csv as pv
-import pyarrow.compute as pc
+import multiprocessing
+import sys
+import queue
+from datetime import datetime
+from config_manager import ConfigManager
+from bq_extractor import extractor_worker
+from sql_loader import loader_worker
 from google.cloud import bigquery_storage
+import pyarrow as pa
 import gcsfs
 
 
-class BqExtractor:
-    def __init__(self, worker_id, config, table_cfg, log_queue, file_queue):
-        self.worker_id = worker_id
-        self.config = config
-        self.table_cfg = table_cfg
-        self.log_queue = log_queue
-        self.file_queue = file_queue
+class MainOrchestrator:
+    def __init__(self, config_path):
+        self.config_manager = ConfigManager(config_path)
+        self.global_cfg = self.config_manager.global_config
+        self.limits_cfg = self.config_manager.limits_config
+        self.table_configs = self.config_manager.table_configs
 
-        self.client = bigquery_storage.BigQueryReadClient(
-            credentials=config.BQ_CREDENTIALS if hasattr(config, 'BQ_CREDENTIALS') else None
+        self.manager = multiprocessing.Manager()
+        self.file_queue = self.manager.Queue(maxsize=1000)
+        self.log_queue = self.manager.Queue()
+        self.archive_queue = self.manager.Queue()
+
+        self.stats = self.manager.dict()
+        self.stats_lock = self.manager.Lock()
+        self.stats['total_files_extracted'] = 0
+        self.stats['total_files_loaded'] = 0
+        self.stats['total_rows'] = 0
+        self.stats['tables_completed'] = 0
+        self.stats['total_extraction_time'] = 0.0
+        self.stats['total_load_time'] = 0.0
+
+    def _log(self, msg, prefix="ORCHESTRATOR"):
+        self.log_queue.put(f"[{prefix}] {msg}")
+
+    def run(self):
+        start_time = datetime.now()
+        print("=" * 80)
+        print(f"ULTRA-FAST BIGQUERY TO SQL SERVER PIPELINE")
+        print(f"Started at: {start_time}")
+        print("=" * 80)
+
+        self._log("--- Pipeline Initialized ---")
+        self._log(f"Tables to process: {len(self.table_configs)}")
+        self._log(f"Max concurrent extractors: {self.limits_cfg.MAX_CONCURRENT_EXTRACT}")
+        self._log(f"Max concurrent loaders: {self.limits_cfg.MAX_CONCURRENT_LOAD}")
+
+        log_process = multiprocessing.Process(target=logger_listener, args=(self.log_queue, self.global_cfg))
+        archive_process = multiprocessing.Process(target=archive_listener, args=(self.archive_queue, self.log_queue, self.global_cfg))
+        monitor_process = multiprocessing.Process(target=progress_monitor, args=(self.log_queue, self.stats, len(self.table_configs)))
+
+        log_process.start()
+        archive_process.start()
+        monitor_process.start()
+
+        self._resume_from_previous_run()
+        self._prepare_sql_server()
+        self._run_workers()
+        self._post_load_optimize()
+        self._shutdown(log_process, archive_process, monitor_process)
+
+        end_time = datetime.now()
+        duration = end_time - start_time
+        print("=" * 80)
+        print(f"PIPELINE COMPLETE | Duration: {duration}")
+        print(f"Tables: {self.stats['tables_completed']}/{len(self.table_configs)}")
+        print(f"Files extracted: {self.stats.get('total_files_extracted', 0)}")
+        print(f"Files loaded: {self.stats.get('total_files_loaded', 0)}")
+        print(f"Extraction time: {self.stats.get('total_extraction_time', 0.0):.2f}s")
+        print(f"Load time: {self.stats.get('total_load_time', 0.0):.2f}s")
+        print("=" * 80)
+
+    def _resume_from_previous_run(self):
+        self._log("Checking for files from a previous run...")
+        gcs = gcsfs.GCSFileSystem(
+            project=self.global_cfg.PROJECT_ID,
+            token=self.global_cfg.BQ_CREDENTIALS if hasattr(self.global_cfg, 'BQ_CREDENTIALS') else None
         )
 
-        self.gcs = gcsfs.GCSFileSystem(
-            project=self.config.PROJECT_ID,
-            token=config.BQ_CREDENTIALS if hasattr(config, 'BQ_CREDENTIALS') else None,
-            asynchronous=False,
-            block_size=16 * 1024 * 1024
+        for table_cfg in self.table_configs:
+            export_path = (
+                f"gs://{self.global_cfg.GCS_BUCKET}/{table_cfg.dataset_id}/"
+                f"{table_cfg.target_table}/pipeline_exports/"
+            )
+            if gcs.exists(export_path):
+                leftover_files = [f for f in gcs.ls(export_path) if not f.endswith('_failed_files.json')]
+                if leftover_files:
+                    self._log(f"Found {len(leftover_files)} leftover files for {table_cfg.target_table}. Resuming.")
+                    for f in leftover_files:
+                        self.file_queue.put((f, table_cfg))
+
+            failed_files_path = (
+                f"gs://{self.global_cfg.GCS_BUCKET}/{table_cfg.dataset_id}/"
+                f"{table_cfg.target_table}/pipeline_exports/_failed_files.json"
+            )
+            if gcs.exists(failed_files_path):
+                try:
+                    with gcs.open(failed_files_path, 'r') as f:
+                        failed_files = json.load(f)
+                    if failed_files:
+                        self._log(f"Found {len(failed_files)} failed files for {table_cfg.target_table}. Re-queuing.")
+                        for f in failed_files:
+                            if gcs.exists(f):
+                                self.file_queue.put((f, table_cfg))
+                            else:
+                                self._log(f"WARNING: Failed file no longer exists: {f}")
+                except Exception as e:
+                    self._log(f"WARNING: Could not read failed files for {table_cfg.target_table}: {e}")
+
+        while not self.file_queue.empty():
+            self._log("Waiting for leftover/failed files to be loaded...")
+            time.sleep(5)
+
+    def _prepare_sql_server(self):
+        """Prepare SQL Server for bulk loading. Uses autocommit=True for ALTER DATABASE."""
+        self._log("Preparing SQL Server for bulk load...")
+        try:
+            import pyodbc
+            conn = pyodbc.connect(self.global_cfg.CONN_STR, autocommit=True)
+            cursor = conn.cursor()
+            cursor.execute(f"ALTER DATABASE [{self.global_cfg.DATABASE_NAME}] SET RECOVERY SIMPLE;")
+            self._log("Set RECOVERY SIMPLE.")
+
+            for table_cfg in self.table_configs:
+                target_table = f"{self.global_cfg.DATABASE_NAME}.dbo.{table_cfg.target_table}"
+                try:
+                    cursor.execute(f"ALTER INDEX ALL ON {target_table} DISABLE;")
+                    cursor.execute(f"ALTER TABLE {target_table} NOCHECK CONSTRAINT ALL;")
+                    cursor.execute(f"DISABLE TRIGGER ALL ON {target_table};")
+                    cursor.execute(f"TRUNCATE TABLE {target_table};")
+                    self._log(f"Prepared table: {table_cfg.target_table}")
+                except Exception as e:
+                    self._log(f"Warning preparing {table_cfg.target_table}: {e}")
+
+            cursor.close()
+            conn.close()
+            self._log("SQL Server preparation complete!")
+        except Exception as e:
+            self._log(f"ERROR preparing SQL Server: {e}")
+
+    def _run_workers(self):
+        extractor_pool = multiprocessing.Pool(
+            processes=self.limits_cfg.MAX_CONCURRENT_EXTRACT,
+            maxtasksperchild=1
         )
 
-        self.write_options = pv.WriteOptions(
-            include_header=False,
-            delimiter='|',
-            quoting_style="none"
-        )
+        loader_processes = []
+        for i in range(1, self.limits_cfg.MAX_CONCURRENT_LOAD + 1):
+            p = multiprocessing.Process(
+                target=loader_worker,
+                args=(i, self.file_queue, self.log_queue, self.archive_queue, self.global_cfg),
+                kwargs={'shared_stats': self.stats, 'stats_lock': self.stats_lock},
+                name=f"Loader-{i}"
+            )
+            p.start()
+            loader_processes.append(p)
 
-        self.limit_bytes = self.config.TARGET_FILE_SIZE_MB * 1024 * 1024
+        self._log(f"Started {len(loader_processes)} loader workers")
 
-        self.stats = {
-            'rows_processed': 0,
-            'bytes_written': 0,
-            'files_created': 0,
-            'start_time': None
-        }
+        pending_tables = list(self.table_configs)
+        running_tables = {}
+        active_extractors = 0
+        last_progress_log = time.time()
+        extraction_start_time = time.time()
 
-    def _log(self, msg):
-        self.log_queue.put(
-            f"[Extractor-{self.table_cfg.target_table}-W{self.worker_id}] {msg}"
-        )
+        while pending_tables or running_tables:
+            completed_tables = []
+            for table_name, results in list(running_tables.items()):
+                if all(r.ready() for r in results):
+                    table_cfg = next(t for t in self.table_configs if t.target_table == table_name)
+                    active_extractors -= table_cfg.extract_workers
+                    self.stats['tables_completed'] = self.stats.get('tables_completed', 0) + 1
+                    self._log(f"EXTRACTION COMPLETE: {table_name} (freed {table_cfg.extract_workers} workers, active: {active_extractors})", prefix=f"TABLE-{table_name}")
+                    completed_tables.append(table_name)
+            for table_name in completed_tables:
+                del running_tables[table_name]
 
-    def _clean_batch(self, arrow_batch):
-        new_columns = []
-        for field in arrow_batch.schema:
-            col = arrow_batch[field.name]
+            while pending_tables:
+                next_table = pending_tables[0]
+                if active_extractors + next_table.extract_workers <= self.limits_cfg.MAX_CONCURRENT_EXTRACT:
+                    pending_tables.pop(0)
+                    results = self._launch_table_extraction(next_table, extractor_pool)
+                    running_tables[next_table.target_table] = results
+                    active_extractors += next_table.extract_workers
+                    self._log(f"LAUNCHED: {next_table.target_table} (workers: {next_table.extract_workers}, active: {active_extractors}, pending: {len(pending_tables)})")
+                else:
+                    break
 
-            if pa.types.is_date(field.type):
-                col = pc.strftime(col, format='%Y-%m-%d')
-            elif pa.types.is_timestamp(field.type):
-                col = pc.strftime(col, format='%Y-%m-%d %H:%M:%S')
-            elif pa.types.is_boolean(field.type):
-                col = pc.if_else(col, "1", "0")
-            elif pa.types.is_decimal(field.type):
-                pass
-            elif pa.types.is_time(field.type):
-                col = pc.strftime(col, format='%H:%M:%S')
+            if time.time() - last_progress_log > 10:
+                queue_size = self.file_queue.qsize()
+                self._log(f"PROGRESS: Running tables: {len(running_tables)}, Pending: {len(pending_tables)}, Queue size: {queue_size}, Active extractors: {active_extractors}/{self.limits_cfg.MAX_CONCURRENT_EXTRACT}")
+                last_progress_log = time.time()
 
-            col = col.cast(pa.string())
-            col = pc.replace_substring(col, pattern='"', replacement='')
-            col = pc.replace_substring(col, pattern='|', replacement='')
-            col = pc.replace_substring(col, pattern='\n', replacement=' ')
-            col = pc.replace_substring(col, pattern='\r', replacement=' ')
-            col = pc.fill_null(col, "")
-            new_columns.append(col)
+            time.sleep(0.5 if running_tables else 2)
 
-        return pa.RecordBatch.from_arrays(new_columns, names=arrow_batch.schema.names)
+        self.stats['total_extraction_time'] = time.time() - extraction_start_time
+        self._log(f"Total extraction time: {self.stats['total_extraction_time']:.2f}s")
+        self._log("All table extractions complete. Shutting down extractor pool.")
+        extractor_pool.close()
+        extractor_pool.join()
 
-    def _open_new_gcs_file(self, stream_idx, part_idx, schema):
-        gcs_path = (
-            f"gs://{self.config.GCS_BUCKET}/{self.table_cfg.dataset_id}/{self.table_cfg.target_table}/"
-            f"pipeline_exports/{self.table_cfg.target_table}_w{self.worker_id:03d}_"
-            f"s{stream_idx:03d}_p{part_idx:03d}.csv"
-        )
-        file_obj = self.gcs.open(gcs_path, 'wb', block_size=16 * 1024 * 1024)
-        writer = pv.CSVWriter(file_obj, schema, write_options=self.write_options)
-        return file_obj, writer, gcs_path
+        self._log("Waiting for file queue to drain...")
+        queue_empty_count = 0
+        while queue_empty_count < 5:
+            if self.file_queue.qsize() == 0:
+                queue_empty_count += 1
+            else:
+                queue_empty_count = 0
+            time.sleep(2)
 
-    def _process_stream(self, stream_name, stream_idx):
-        reader = self.client.read_rows(stream_name)
+        self._log("Sending stop signals to loaders...")
+        for _ in loader_processes:
+            self.file_queue.put(None)
 
-        rows_in_stream = 0
-        part_idx = 1
-        file_obj, writer, gcs_path = None, None, None
+        self._log("Waiting for loaders to finish...")
+        for p in loader_processes:
+            p.join(timeout=300)
+            if p.is_alive():
+                self._log(f"WARNING: Loader {p.name} still running, terminating...")
+                p.terminate()
 
-        # FIX: track written bytes ourselves — gcsfs file_obj.tell() resets to 0
-        # after the internal buffer is flushed, so it cannot be used for size checks.
-        bytes_in_current_file = 0
-
-        last_log_time = time.time()
-        stream_start = time.time()
-
-        self._log(f"Stream {stream_idx}: START reading")
+    def _launch_table_extraction(self, table_cfg, pool):
+        """
+        Launch extraction workers for a single table.
+        Extracts Arrow schema bytes from the read_session and passes them
+        to each worker so they can deserialize Arrow IPC responses correctly.
+        """
+        self._log(f"Starting extraction: {table_cfg.source_table} -> {table_cfg.target_table}", prefix=f"TABLE-{table_cfg.target_table}")
 
         try:
-            for page in reader.rows().pages:
-                batch = self._clean_batch(page.to_arrow())
+            client = bigquery_storage.BigQueryReadClient(
+                credentials=self.global_cfg.BQ_CREDENTIALS
+            )
 
-                if file_obj is None:
-                    file_obj, writer, gcs_path = self._open_new_gcs_file(
-                        stream_idx, part_idx, batch.schema
-                    )
-                    bytes_in_current_file = 0
-                    self._log(
-                        f"Stream {stream_idx}: Opened part {part_idx} -> "
-                        f"{os.path.basename(gcs_path)}"
-                    )
+            table_path = (
+                f"projects/{self.global_cfg.PROJECT_ID}/"
+                f"datasets/{table_cfg.dataset_id}/"
+                f"tables/{table_cfg.source_table}"
+            )
 
-                writer.write_batch(batch)
-                bytes_in_current_file += batch.nbytes  # Arrow in-memory bytes proxy
+            session = client.create_read_session(
+                parent=f"projects/{self.global_cfg.PROJECT_ID}",
+                read_session=bigquery_storage.types.ReadSession(
+                    table=table_path,
+                    data_format=bigquery_storage.types.DataFormat.ARROW,
+                ),
+                max_stream_count=self.global_cfg.TARGET_STREAM_COUNT,
+            )
 
-                # Progress log every 5s
-                if time.time() - last_log_time >= 5:
-                    elapsed = time.time() - stream_start
-                    rps = rows_in_stream / elapsed if elapsed > 0 else 0
-                    self._log(
-                        f"Stream {stream_idx} | Rows: {rows_in_stream:,} ({rps:,.0f} r/s) | "
-                        f"File: {bytes_in_current_file/(1024*1024):.1f}/{self.config.TARGET_FILE_SIZE_MB} MB"
-                    )
-                    last_log_time = time.time()
+            streams = [s.name for s in session.streams]
+            actual_stream_count = len(streams)
+            self._log(f"Created {actual_stream_count} streams for {table_cfg.target_table}", prefix=f"TABLE-{table_cfg.target_table}")
 
-                rows_in_stream += batch.num_rows
+            # Extract Arrow schema bytes from session
+            # Workers deserialize this to get pyarrow.Schema for pa.ipc.read_record_batch()
+            arrow_schema_bytes = bytes(session.arrow_schema.serialized_schema)
 
-                # Rotate file when size threshold crossed
-                if bytes_in_current_file >= self.limit_bytes:
-                    writer.close()
-                    file_obj.close()
-                    size_mb = bytes_in_current_file / (1024 * 1024)
-                    self._log(
-                        f"Stream {stream_idx}: Queued {os.path.basename(gcs_path)} "
-                        f"({size_mb:.1f} MB, part {part_idx})"
-                    )
-                    self.file_queue.put((gcs_path, self.table_cfg))
-                    self.stats['files_created'] += 1
-                    self.stats['bytes_written'] += bytes_in_current_file
+            num_workers = min(table_cfg.extract_workers, actual_stream_count)
+            chunks = [[] for _ in range(num_workers)]
+            for i, stream in enumerate(streams):
+                chunks[i % num_workers].append(stream)
 
-                    part_idx += 1
-                    file_obj, writer, gcs_path = self._open_new_gcs_file(
-                        stream_idx, part_idx, batch.schema
-                    )
-                    bytes_in_current_file = 0
-                    self._log(
-                        f"Stream {stream_idx}: Rotated -> part {part_idx} "
-                        f"{os.path.basename(gcs_path)}"
-                    )
-                    last_log_time = time.time()
+            worker_args = [
+                (chunk, i + 1, self.global_cfg, table_cfg, self.file_queue, self.log_queue, arrow_schema_bytes)
+                for i, chunk in enumerate(chunks)
+                if chunk
+            ]
 
-            # Close and queue final file
-            if writer and file_obj:
-                writer.close()
-                file_obj.close()
-                size_mb = bytes_in_current_file / (1024 * 1024)
-                self._log(
-                    f"Stream {stream_idx}: Queued {os.path.basename(gcs_path)} "
-                    f"({size_mb:.1f} MB, part {part_idx}) [final]"
-                )
-                self.file_queue.put((gcs_path, self.table_cfg))
-                self.stats['files_created'] += 1
-                self.stats['bytes_written'] += bytes_in_current_file
+            results = [pool.apply_async(extractor_worker, args=(args,)) for args in worker_args]
+            self._log(f"Submitted {len(results)} extractor tasks for {table_cfg.target_table}", prefix=f"TABLE-{table_cfg.target_table}")
+            return results
 
         except Exception as e:
-            self._log(f"ERROR in stream {stream_idx}: {str(e)}")
-            if writer:
-                try: writer.close()
-                except: pass
-            if file_obj:
-                try: file_obj.close()
-                except: pass
-            raise
+            self._log(f"ERROR launching extraction for {table_cfg.target_table}: {e}", prefix=f"TABLE-{table_cfg.target_table}")
+            return []
 
-        elapsed = time.time() - stream_start
-        throughput = rows_in_stream / elapsed if elapsed > 0 else 0
-        self._log(
-            f"Stream {stream_idx}: DONE | {rows_in_stream:,} rows | "
-            f"{part_idx} file(s) | {elapsed:.1f}s | {throughput:,.0f} rows/s"
-        )
-        return rows_in_stream
+    def _post_load_optimize(self):
+        """Rebuild indexes and restore SQL Server. Uses autocommit=True for ALTER DATABASE."""
+        self._log("Starting post-load optimization...")
+        try:
+            import pyodbc
+            conn = pyodbc.connect(self.global_cfg.CONN_STR, autocommit=True)
+            cursor = conn.cursor()
 
-    def run(self, stream_chunk):
-        self.stats['start_time'] = time.time()
-        self._log(f"Worker started. Processing {len(stream_chunk)} streams.")
+            for table_cfg in self.table_configs:
+                target_table = f"{self.global_cfg.DATABASE_NAME}.dbo.{table_cfg.target_table}"
+                try:
+                    self._log(f"Optimizing {table_cfg.target_table}...")
+                    cursor.execute(f"ALTER INDEX ALL ON {target_table} REBUILD WITH (DATA_COMPRESSION = PAGE, ONLINE = OFF);")
+                    cursor.execute(f"UPDATE STATISTICS {target_table} WITH FULLSCAN;")
+                    cursor.execute(f"ALTER TABLE {target_table} CHECK CONSTRAINT ALL;")
+                    cursor.execute(f"ENABLE TRIGGER ALL ON {target_table};")
+                    self._log(f"Optimized {table_cfg.target_table}")
+                except Exception as e:
+                    self._log(f"Warning optimizing {table_cfg.target_table}: {e}")
 
-        total_rows = 0
-        for i, stream_name in enumerate(stream_chunk, 1):
-            try:
-                rows = self._process_stream(stream_name, i)
-                total_rows += rows
-                self.stats['rows_processed'] += rows
-                self._log(f"Completed stream {i}/{len(stream_chunk)}: {rows:,} rows")
-            except Exception as e:
-                self._log(f"CRITICAL ERROR on stream {i}: {str(e)}")
+            cursor.execute(f"ALTER DATABASE [{self.global_cfg.DATABASE_NAME}] SET RECOVERY FULL;")
+            cursor.close()
+            conn.close()
+            self._log("Post-load optimization complete!")
+        except Exception as e:
+            self._log(f"ERROR in post-load optimization: {e}")
+
+    def _shutdown(self, log_process, archive_process, monitor_process):
+        self._log("Shutting down pipeline...")
+        if monitor_process.is_alive():
+            monitor_process.terminate()
+            monitor_process.join(timeout=5)
+        self._log("Shutting down archiver...")
+        self.archive_queue.put(None)
+        archive_process.join(timeout=30)
+        if archive_process.is_alive():
+            archive_process.terminate()
+        time.sleep(2)
+        self._log("--- PIPELINE COMPLETE ---")
+        self.log_queue.put(None)
+        log_process.join(timeout=10)
+        if log_process.is_alive():
+            log_process.terminate()
+
+
+def logger_listener(log_queue, global_cfg):
+    log_files = {}
+    base_log_dir = global_cfg.LOG_DIR
+    os.makedirs(base_log_dir, exist_ok=True)
+
+    while True:
+        try:
+            record = log_queue.get(timeout=1)
+            if record is None:
+                break
+            if ']' not in record:
                 continue
+            prefix, message = record.split(']', 1)
+            log_prefix = prefix[1:]
+            log_dir, log_filename = get_log_path(base_log_dir, log_prefix)
+            os.makedirs(log_dir, exist_ok=True)
+            file_key = os.path.join(log_dir, log_filename)
+            if file_key not in log_files:
+                log_files[file_key] = open(file_key, 'a', buffering=1)
+            timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            log_files[file_key].write(f"[{timestamp}] {message.strip()}\n")
+            print(f"[{log_prefix}] [{timestamp}] {message.strip()}")
+        except queue.Empty:
+            continue
+        except Exception as e:
+            print(f"Logger error: {e}")
 
-        elapsed = time.time() - self.stats['start_time']
-        throughput = total_rows / elapsed if elapsed > 0 else 0
-        summary = (
-            f"Worker {self.worker_id} COMPLETE: "
-            f"{total_rows:,} rows | {self.stats['files_created']} files | "
-            f"{self.stats['bytes_written'] / (1024**3):.2f} GB | "
-            f"{elapsed:.1f}s | {throughput:,.0f} rows/s"
-        )
-        self._log(summary)
-        return summary
+    for f in log_files.values():
+        f.close()
 
 
-def extractor_worker(args):
-    stream_chunk, worker_id, config, table_cfg, file_queue, log_queue = args
-    extractor = BqExtractor(
-        worker_id=worker_id,
-        config=config,
-        table_cfg=table_cfg,
-        log_queue=log_queue,
-        file_queue=file_queue
+def get_log_path(base_dir, prefix):
+    if prefix.startswith("Loader-"):
+        worker_id = prefix.split('-')[1] if len(prefix.split('-')) > 1 else "unknown"
+        return os.path.join(base_dir, "loaders"), f"loader_{worker_id}.log"
+    if prefix.startswith("Extractor-"):
+        parts = prefix.split('-')
+        table_name = parts[1] if len(parts) > 1 else "unknown"
+        return os.path.join(base_dir, "extractors", table_name), "extractor.log"
+    if prefix.startswith("TABLE-"):
+        table_name = prefix.split('-', 1)[1] if '-' in prefix else "unknown"
+        return os.path.join(base_dir, "tables", table_name), "table.log"
+    if prefix == "MONITOR":
+        return base_dir, "monitor.log"
+    return base_dir, "orchestrator.log"
+
+
+def archive_listener(archive_queue, log_queue, global_cfg):
+    gcs = gcsfs.GCSFileSystem(
+        project=global_cfg.PROJECT_ID,
+        token=global_cfg.BQ_CREDENTIALS if hasattr(global_cfg, 'BQ_CREDENTIALS') else None
     )
-    return extractor.run(stream_chunk)
+    while True:
+        try:
+            item = archive_queue.get(timeout=5)
+            if item is None:
+                break
+            action, gcs_path, table_cfg = item
+            filename = os.path.basename(gcs_path)
+            log_queue.put(f"[ARCHIVER] Received: {action} for {filename}")
+            if action == 'DELETE':
+                gcs.rm(gcs_path)
+                log_queue.put(f"[ARCHIVER] Deleted: {filename}")
+            elif action == 'ARCHIVE':
+                archive_path = (
+                    f"gs://{global_cfg.GCS_BUCKET}/{table_cfg.dataset_id}/{table_cfg.target_table}/"
+                    f"pipeline_archive/{datetime.now().strftime('%Y-%m-%d')}/{filename}"
+                )
+                archive_dir = os.path.dirname(archive_path)
+                if not gcs.exists(archive_dir):
+                    gcs.mkdirs(archive_dir, exist_ok=True)
+                gcs.mv(gcs_path, archive_path)
+                log_queue.put(f"[ARCHIVER] Archived {filename} to {archive_path}")
+        except queue.Empty:
+            continue
+        except Exception as e:
+            log_queue.put(f"[ARCHIVER] ERROR: {e}")
+
+
+def progress_monitor(log_queue, stats, total_tables):
+    start_time = time.time()
+    while True:
+        try:
+            time.sleep(30)
+            elapsed = time.time() - start_time
+            tables_done = stats.get('tables_completed', 0)
+            log_queue.put(
+                f"[MONITOR] Progress: {tables_done}/{total_tables} tables, "
+                f"{stats.get('total_files_extracted', 0)} files extracted, "
+                f"{stats.get('total_files_loaded', 0)} files loaded, "
+                f"{elapsed / 60:.1f} minutes elapsed"
+            )
+            if tables_done >= total_tables:
+                break
+        except Exception as e:
+            log_queue.put(f"[MONITOR] ERROR: {e}")
+            break
+
+
+def main():
+    config_path = sys.argv[1] if len(sys.argv) > 1 else "pipeline_config.json"
+    if not os.path.exists(config_path):
+        print(f"ERROR: Config file not found: {config_path}")
+        sys.exit(1)
+    try:
+        orchestrator = MainOrchestrator(config_path)
+        orchestrator.run()
+    except KeyboardInterrupt:
+        print("\nPipeline interrupted by user!")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\nFATAL ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
