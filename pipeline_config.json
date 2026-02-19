@@ -1,0 +1,38 @@
+{
+  "global_settings": {
+    "PROJECT_ID": "your-gcp-project-id",
+    "DATABASE_NAME": "YourSqlDatabase",
+    "DATASET_ID": "your_bq_dataset",
+    "SQL_SERVER": "your-sql-server-host",
+    "GCS_BUCKET": "your-gcs-bucket",
+    "OUTPUT_DIR": "pipeline_exports",
+    "ARCHIVE_DIR": "pipeline_archive",
+    "LOG_DIR": "pipeline_logs",
+    "LOCAL_TEMP_DIR": "/tmp/pipeline_temp",
+    "TARGET_STREAM_COUNT": 100,
+    "TARGET_FILE_SIZE_MB": 300,
+    "BATCH_SIZE": 100000,
+    "DELETE_AFTER_LOAD": true,
+    "USE_BCP": true,
+    "AUTH_METHOD": "default",
+    "KEY_PATH": null
+  },
+  "global_limits": {
+    "MAX_CONCURRENT_EXTRACT": 80,
+    "MAX_CONCURRENT_LOAD": 64,
+    "DEFAULT_EXTRACT_WORKERS": 10,
+    "DEFAULT_LOAD_WORKERS": 6
+  },
+  "tables": [
+    {
+      "source_table": "source_table_name",
+      "target_table": "target_table_name",
+      "dataset_id": "your_bq_dataset",
+      "priority": 1,
+      "extract_workers": 10,
+      "load_workers": 6,
+      "temp_table_ids": [],
+      "format_file": ""
+    }
+  ]
+}
