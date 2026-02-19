@@ -34,7 +34,6 @@ class BqExtractor:
             quoting_style="none"
         )
 
-        # Target file size in bytes - used for rotation
         self.limit_bytes = self.config.TARGET_FILE_SIZE_MB * 1024 * 1024
 
         self.stats = {
@@ -50,7 +49,7 @@ class BqExtractor:
         )
 
     def _clean_batch(self, arrow_batch):
-        """Clean and transform Arrow batch for SQL Server compatibility."""
+        """Clean and transform Arrow RecordBatch for SQL Server compatibility."""
         new_columns = []
         for field in arrow_batch.schema:
             col = arrow_batch[field.name]
@@ -77,7 +76,7 @@ class BqExtractor:
         return pa.RecordBatch.from_arrays(new_columns, names=arrow_batch.schema.names)
 
     def _open_new_gcs_file(self, stream_idx, part_idx, schema):
-        """Open a new GCS file. Returns (file_obj, writer, gcs_path)."""
+        """Open a new GCS file for writing. Returns (file_obj, writer, gcs_path)."""
         gcs_path = (
             f"gs://{self.config.GCS_BUCKET}/{self.table_cfg.dataset_id}/{self.table_cfg.target_table}/"
             f"pipeline_exports/{self.table_cfg.target_table}_w{self.worker_id:03d}_"
@@ -88,50 +87,40 @@ class BqExtractor:
         return file_obj, writer, gcs_path
 
     def _close_and_queue_file(self, file_obj, writer, gcs_path, stream_idx, part_idx, written_bytes):
-        """
-        Flush, close and queue a completed file.
-        Uses self-tracked written_bytes (NOT file_obj.tell()) to avoid
-        gcsfs buffer pointer issues after close.
-        """
-        # Read tell() BEFORE close for size reporting
-        try:
-            reported_size = file_obj.tell()
-        except Exception:
-            reported_size = written_bytes
-
+        """Close current GCS file and queue it for loading."""
         writer.close()
         file_obj.close()
 
         size_mb = written_bytes / (1024 * 1024)
         self._log(
             f"Stream {stream_idx}: Queued {os.path.basename(gcs_path)} "
-            f"({size_mb:.1f} MB, part {part_idx}) -> loader"
+            f"({size_mb:.1f} MB, part {part_idx})"
         )
-
-        # Always queue - even if written_bytes is small
-        # Loader handles 0-row files gracefully
         self.file_queue.put((gcs_path, self.table_cfg))
         self.stats['files_created'] += 1
         self.stats['bytes_written'] += written_bytes
 
     def _process_stream(self, stream_name, stream_idx):
         """
-        Process a single BigQuery Storage API stream.
-        Tracks written bytes with a self-managed counter (not file_obj.tell())
-        to avoid gcsfs buffering issues.
-        """
-        reader = self.client.read_rows(stream_name)
+        Process a single BQ Storage API stream using ARROW format correctly.
 
-        rows_in_stream = 0
-        page_count = 0
-        part_idx = 1
+        IMPORTANT: Uses direct gRPC response iteration with response.arrow_record_batch()
+        NOT reader.rows().pages - that pattern is for AVRO and causes gRPC hangs
+        on ARROW streams when waiting for page boundaries that never arrive.
+
+        Uses self-tracked byte counter (NOT file_obj.tell()) since gcsfs
+        resets the buffer pointer to 0 after close().
+        """
+        # Timeout per stream: 10 minutes max - prevents indefinite hangs
+        STREAM_TIMEOUT = 600
 
         file_obj = None
         writer = None
         gcs_path = None
-
-        # FIX: Track bytes ourselves - do NOT rely on file_obj.tell() for rotation
         bytes_in_current_file = 0
+        rows_in_stream = 0
+        response_count = 0
+        part_idx = 1
 
         stream_start = time.time()
         last_log_time = time.time()
@@ -139,23 +128,25 @@ class BqExtractor:
         self._log(f"Stream {stream_idx}: START reading")
 
         try:
-            for page in reader.rows().pages:
-                batch = self._clean_batch(page.to_arrow())
-                page_rows = batch.num_rows
+            # CORRECT: iterate gRPC responses directly with timeout
+            # DataFormat.ARROW -> use response.arrow_record_batch()
+            # DO NOT use reader.rows().pages (AVRO pattern - hangs on ARROW streams)
+            responses = self.client.read_rows(stream_name, timeout=STREAM_TIMEOUT)
 
-                if page_rows == 0:
+            for response in responses:
+                # Extract Arrow batch directly from gRPC response
+                raw_batch = response.arrow_record_batch()
+
+                if raw_batch.num_rows == 0:
                     continue
 
-                page_count += 1
-                rows_in_stream += page_rows
+                # Clean the batch for SQL Server compatibility
+                batch = self._clean_batch(raw_batch)
+                response_count += 1
+                rows_in_stream += batch.num_rows
+                page_bytes = batch.nbytes  # Arrow in-memory size (proxy for CSV size)
 
-                # Estimate serialized CSV byte size from batch
-                # batch.nbytes = Arrow in-memory bytes (uncompressed)
-                # CSV pipe-delimited is typically 60-80% of Arrow nbytes for text data
-                # Use nbytes as the rotation threshold proxy - conservative but reliable
-                page_bytes = batch.nbytes
-
-                # Open a new GCS file if needed
+                # Open GCS file on first response
                 if file_obj is None:
                     file_obj, writer, gcs_path = self._open_new_gcs_file(
                         stream_idx, part_idx, batch.schema
@@ -166,24 +157,24 @@ class BqExtractor:
                         f"{os.path.basename(gcs_path)}"
                     )
 
-                # Write batch
+                # Write to CSV
                 writer.write_batch(batch)
                 bytes_in_current_file += page_bytes
 
                 # Progress log every 5 seconds
                 if time.time() - last_log_time >= 5:
-                    stream_elapsed = time.time() - stream_start
-                    rows_per_sec = rows_in_stream / stream_elapsed if stream_elapsed > 0 else 0
+                    elapsed = time.time() - stream_start
+                    rps = rows_in_stream / elapsed if elapsed > 0 else 0
                     file_mb = bytes_in_current_file / (1024 * 1024)
                     self._log(
-                        f"Stream {stream_idx} | Page {page_count} | "
-                        f"Rows: {rows_in_stream:,} ({rows_per_sec:,.0f} r/s) | "
+                        f"Stream {stream_idx} | Response {response_count} | "
+                        f"Rows: {rows_in_stream:,} ({rps:,.0f} r/s) | "
                         f"File: {file_mb:.1f}/{self.config.TARGET_FILE_SIZE_MB} MB | "
                         f"Part: {part_idx}"
                     )
                     last_log_time = time.time()
 
-                # Rotate file if size threshold crossed
+                # Rotate file when size threshold crossed
                 if bytes_in_current_file >= self.limit_bytes:
                     self._close_and_queue_file(
                         file_obj, writer, gcs_path,
@@ -195,14 +186,12 @@ class BqExtractor:
                     )
                     bytes_in_current_file = 0
                     self._log(
-                        f"Stream {stream_idx}: Rotated to part {part_idx} -> "
+                        f"Stream {stream_idx}: Rotated -> part {part_idx} "
                         f"{os.path.basename(gcs_path)}"
                     )
                     last_log_time = time.time()
 
-            # FIX: Always queue the final file if it was opened (has rows)
-            # Do NOT check tell() or bytes to decide - just queue it
-            # An empty file is harmless; BCP reports 0 rows and moves on
+            # Queue final file (always - even if small)
             if file_obj is not None and writer is not None:
                 self._close_and_queue_file(
                     file_obj, writer, gcs_path,
@@ -227,7 +216,7 @@ class BqExtractor:
         throughput = rows_in_stream / stream_elapsed if stream_elapsed > 0 else 0
         self._log(
             f"Stream {stream_idx}: DONE | {rows_in_stream:,} rows | "
-            f"{page_count} pages | {part_idx} file(s) | "
+            f"{response_count} responses | {part_idx} file(s) | "
             f"{stream_elapsed:.1f}s | {throughput:,.0f} rows/s"
         )
         return rows_in_stream
@@ -251,7 +240,6 @@ class BqExtractor:
 
         elapsed = time.time() - self.stats['start_time']
         throughput = total_rows / elapsed if elapsed > 0 else 0
-
         summary = (
             f"Worker {self.worker_id} COMPLETE: "
             f"{total_rows:,} rows | "
