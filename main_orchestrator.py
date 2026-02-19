@@ -106,7 +106,7 @@ class MainOrchestrator:
     def _resume_from_previous_run(self):
         """
         Load any files left over from a previous failed run.
-        Also re-queues files that were recorded as failed in _failed_files.json.
+        Also re-queues files recorded as failed in _failed_files.json.
         """
         self._log("Checking for files from a previous run...")
         gcs = gcsfs.GCSFileSystem(
@@ -162,16 +162,23 @@ class MainOrchestrator:
             time.sleep(5)
 
     def _prepare_sql_server(self):
-        """Prepare SQL Server for bulk loading"""
+        """
+        Prepare SQL Server for bulk loading.
+        Uses autocommit=True connection because ALTER DATABASE cannot run
+        inside a transaction (error 226).
+        """
         self._log("Preparing SQL Server for bulk load...")
 
         try:
             import pyodbc
-            conn = pyodbc.connect(self.global_cfg.CONN_STR)
+
+            # FIX: Use autocommit=True - ALTER DATABASE is not allowed inside a transaction
+            conn = pyodbc.connect(self.global_cfg.CONN_STR, autocommit=True)
             cursor = conn.cursor()
 
             # Set database to simple recovery for speed
-            cursor.execute(f"ALTER DATABASE {self.global_cfg.DATABASE_NAME} SET RECOVERY SIMPLE;")
+            cursor.execute(f"ALTER DATABASE [{self.global_cfg.DATABASE_NAME}] SET RECOVERY SIMPLE;")
+            self._log("Set RECOVERY SIMPLE.")
 
             for table_cfg in self.table_configs:
                 target_table = f"{self.global_cfg.DATABASE_NAME}.dbo.{table_cfg.target_table}"
@@ -187,7 +194,6 @@ class MainOrchestrator:
                 except Exception as e:
                     self._log(f"Warning preparing {table_cfg.target_table}: {e}")
 
-            conn.commit()
             cursor.close()
             conn.close()
 
@@ -204,11 +210,13 @@ class MainOrchestrator:
             maxtasksperchild=1
         )
 
+        # FIX: loader_worker signature now accepts stats and stats_lock as keyword args
         loader_processes = []
         for i in range(1, self.limits_cfg.MAX_CONCURRENT_LOAD + 1):
             p = multiprocessing.Process(
                 target=loader_worker,
-                args=(i, self.file_queue, self.log_queue, self.archive_queue, self.global_cfg, self.stats, self.stats_lock),
+                args=(i, self.file_queue, self.log_queue, self.archive_queue, self.global_cfg),
+                kwargs={'shared_stats': self.stats, 'stats_lock': self.stats_lock},
                 name=f"Loader-{i}"
             )
             p.start()
@@ -374,12 +382,17 @@ class MainOrchestrator:
             return []
 
     def _post_load_optimize(self):
-        """Rebuild indexes and restore SQL Server to normal state"""
+        """
+        Rebuild indexes and restore SQL Server to normal state.
+        Uses autocommit=True for ALTER DATABASE compatibility.
+        """
         self._log("Starting post-load optimization...")
 
         try:
             import pyodbc
-            conn = pyodbc.connect(self.global_cfg.CONN_STR)
+
+            # FIX: autocommit=True required for ALTER DATABASE
+            conn = pyodbc.connect(self.global_cfg.CONN_STR, autocommit=True)
             cursor = conn.cursor()
 
             for table_cfg in self.table_configs:
@@ -392,7 +405,6 @@ class MainOrchestrator:
                         f"ALTER INDEX ALL ON {target_table} "
                         f"REBUILD WITH (DATA_COMPRESSION = PAGE, ONLINE = OFF);"
                     )
-
                     cursor.execute(f"UPDATE STATISTICS {target_table} WITH FULLSCAN;")
                     cursor.execute(f"ALTER TABLE {target_table} CHECK CONSTRAINT ALL;")
                     cursor.execute(f"ENABLE TRIGGER ALL ON {target_table};")
@@ -402,11 +414,11 @@ class MainOrchestrator:
                 except Exception as e:
                     self._log(f"Warning optimizing {table_cfg.target_table}: {e}")
 
+            # Set recovery back to FULL
             cursor.execute(
-                f"ALTER DATABASE {self.global_cfg.DATABASE_NAME} SET RECOVERY FULL;"
+                f"ALTER DATABASE [{self.global_cfg.DATABASE_NAME}] SET RECOVERY FULL;"
             )
 
-            conn.commit()
             cursor.close()
             conn.close()
 

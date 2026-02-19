@@ -13,11 +13,13 @@ from pathlib import Path
 
 
 class SqlLoader:
-    def __init__(self, worker_id, config, log_queue, archive_queue):
+    def __init__(self, worker_id, config, log_queue, archive_queue, shared_stats=None, stats_lock=None):
         self.worker_id = worker_id
         self.config = config
         self.log_queue = log_queue
         self.archive_queue = archive_queue
+        self.shared_stats = shared_stats      # shared multiprocessing dict from orchestrator
+        self.stats_lock = stats_lock          # shared lock for updating stats
 
         # Initialize SQL connection
         self.db_engine = self._init_sql_engine()
@@ -36,7 +38,7 @@ class SqlLoader:
         # Configure worker affinity
         self._configure_worker()
 
-        # Performance stats
+        # Local performance stats
         self.stats = {
             'files_loaded': 0,
             'total_rows': 0,
@@ -73,14 +75,10 @@ class SqlLoader:
             return None
 
     def _configure_worker(self):
-        """
-        Pin worker to specific CPU core for better cache locality
-        Set high priority for faster processing
-        """
+        """Pin worker to specific CPU core for better cache locality"""
         try:
             p = psutil.Process(os.getpid())
             available_cores = list(range(psutil.cpu_count(logical=True)))
-
             cpu_to_pin = available_cores[(self.worker_id - 1) % len(available_cores)]
             p.cpu_affinity([cpu_to_pin])
 
@@ -91,7 +89,6 @@ class SqlLoader:
                     p.nice(-10)
                 except:
                     pass
-
         except Exception as e:
             self._log(f"Warning: CPU pinning/priority failed: {e}")
 
@@ -141,7 +138,6 @@ class SqlLoader:
 
     def _use_bcp_instead(self, file_path, target_table, table_cfg):
         """Use BCP for loading"""
-
         if not os.path.exists(file_path):
             raise Exception(f"File not found: {file_path}")
 
@@ -180,23 +176,14 @@ class SqlLoader:
         ]
 
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=1800
-            )
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
 
             if result.returncode != 0:
-                error_details = []
-                error_details.append(f"Exit code: {result.returncode}")
-
+                error_details = [f"Exit code: {result.returncode}"]
                 if result.stdout:
                     error_details.append(f"STDOUT: {result.stdout}")
-
                 if result.stderr:
                     error_details.append(f"STDERR: {result.stderr}")
-
                 if os.path.exists(error_file):
                     try:
                         with open(error_file, 'r') as f:
@@ -205,7 +192,6 @@ class SqlLoader:
                                 error_details.append(f"ERROR FILE: {err_content}")
                     except:
                         pass
-
                 raise Exception("\n".join(error_details))
 
             rows_loaded = 0
@@ -231,7 +217,6 @@ class SqlLoader:
     def _bulk_insert(self, file_path, target_table, format_file):
         """Standard BULK INSERT method"""
         abs_file_path = os.path.abspath(file_path)
-
         full_table_name = f"{self.config.DATABASE_NAME}.{target_table}"
 
         sql = text(f"""
@@ -258,17 +243,12 @@ class SqlLoader:
         for attempt in range(max_retries):
             try:
                 start = time.time()
-
                 self.gcs.get(gcs_path, local_path)
-
                 download_time = time.time() - start
                 file_size = os.path.getsize(local_path)
-
                 self.stats['download_time'] += download_time
                 self.stats['total_bytes'] += file_size
-
                 return True
-
             except Exception as e:
                 if attempt < max_retries - 1:
                     self._log(f"Download failed (attempt {attempt + 1}), retrying: {e}")
@@ -282,7 +262,6 @@ class SqlLoader:
     def _load_to_sql(self, file_path, target_table, table_cfg):
         """Load file to SQL Server using best available method"""
         use_bcp = getattr(self.config, 'USE_BCP', True)
-
         max_retries = 3
 
         for attempt in range(max_retries):
@@ -295,23 +274,25 @@ class SqlLoader:
                     rows_loaded = self._bulk_insert(file_path, target_table, table_cfg.format_file)
 
                 load_time = time.time() - start
-                throughput = rows_loaded / load_time if load_time > 0 else 0
-
                 self.stats['load_time'] += load_time
                 self.stats['total_rows'] += rows_loaded
                 self.stats['files_loaded'] += 1
+
+                # Update shared stats for orchestrator monitoring
+                if self.shared_stats is not None and self.stats_lock is not None:
+                    with self.stats_lock:
+                        self.shared_stats['total_files_loaded'] = self.shared_stats.get('total_files_loaded', 0) + 1
+                        self.shared_stats['total_rows'] = self.shared_stats.get('total_rows', 0) + rows_loaded
 
                 return True
 
             except pyodbc.Error as e:
                 error_code = str(e)
-
                 if '4861' in error_code or 'timeout' in error_code.lower():
                     if attempt < max_retries - 1:
                         self._log(f"DB error (attempt {attempt + 1}), retrying: {e}")
                         time.sleep(2 ** attempt)
                         continue
-
                 self._log(f"CRITICAL: SQL error on {os.path.basename(file_path)}: {e}")
                 return False
 
@@ -323,22 +304,18 @@ class SqlLoader:
 
     def _upload_to_db(self, gcs_path, table_cfg):
         """
-        Main method: download from GCS and load to SQL Server
-        On failure: records file in _failed_files.json for retry on next run
-        On success: removes file from _failed_files.json if previously failed
+        Main method: download from GCS and load to SQL Server.
+        On failure: records file in _failed_files.json for retry on next run.
+        On success: removes file from _failed_files.json if previously failed.
         """
         filename = os.path.basename(gcs_path)
         local_path = os.path.join(self.local_temp_dir, f"loader_{self.worker_id}_{filename}")
-
-        target_name = self._get_target_table(table_cfg)
-        if not target_name:
-            self._log(f"ERROR: No target table for {filename}")
-            return
+        target_name = f"dbo.{table_cfg.target_table}"
 
         try:
             # Step 1: Download from GCS
             if not self._download_from_gcs(gcs_path, local_path):
-                self._record_failure(gcs_path, table_cfg)   # ROLLBACK: track failed download
+                self._record_failure(gcs_path, table_cfg)
                 return
 
             # Step 2: Load to SQL Server
@@ -346,14 +323,14 @@ class SqlLoader:
 
             # Step 3: Archive/delete on success, record failure otherwise
             if success:
-                self._clear_failure(gcs_path, table_cfg)    # ROLLBACK: clear if previously failed
+                self._clear_failure(gcs_path, table_cfg)
                 self._queue_for_archiving(gcs_path, table_cfg)
             else:
-                self._record_failure(gcs_path, table_cfg)   # ROLLBACK: track failed load
+                self._record_failure(gcs_path, table_cfg)
 
         except Exception as e:
             self._log(f"CRITICAL: Unexpected error processing {filename}: {e}")
-            self._record_failure(gcs_path, table_cfg)        # ROLLBACK: track unexpected failure
+            self._record_failure(gcs_path, table_cfg)
 
         finally:
             if os.path.exists(local_path):
@@ -361,14 +338,6 @@ class SqlLoader:
                     os.remove(local_path)
                 except:
                     pass
-
-    def _get_target_table(self, table_cfg):
-        """Determine target table - return 2-part name (schema.table)"""
-        if hasattr(table_cfg, 'temp_table_ids') and table_cfg.temp_table_ids:
-            temp_table = random.choice(table_cfg.temp_table_ids)
-            return f"dbo.{temp_table}"
-
-        return f"dbo.{table_cfg.target_table}"
 
     def _queue_for_archiving(self, gcs_path, table_cfg):
         """Queue file for archiving or deletion"""
@@ -385,7 +354,6 @@ class SqlLoader:
             return
 
         processed_count = 0
-        load_start_time = time.time()
 
         while True:
             try:
@@ -412,10 +380,6 @@ class SqlLoader:
                 self._log(f"ERROR in main loop: {e}")
                 continue
 
-        load_end_time = time.time()
-        self.stats['total_load_time'] = load_end_time - load_start_time
-        self._log(f"Total load time: {self.stats['total_load_time']:.2f} seconds")
-
         total_time = time.time() - self.stats['start_time']
         avg_throughput = self.stats['total_rows'] / total_time if total_time > 0 else 0
 
@@ -428,9 +392,10 @@ class SqlLoader:
         )
 
 
-def loader_worker(worker_id, file_queue, log_queue, archive_queue, config):
+def loader_worker(worker_id, file_queue, log_queue, archive_queue, config, shared_stats=None, stats_lock=None):
     """
-    Multiprocessing worker entry point
+    Multiprocessing worker entry point.
+    Accepts optional shared_stats and stats_lock for orchestrator-level tracking.
     """
-    loader = SqlLoader(worker_id, config, log_queue, archive_queue)
+    loader = SqlLoader(worker_id, config, log_queue, archive_queue, shared_stats, stats_lock)
     loader.run(file_queue)
